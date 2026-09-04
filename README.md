@@ -1,6 +1,6 @@
 # SpaceMouse Hardware Test
 
-Linux hardware/function test for 3Dconnexion SpaceMouse devices, aimed at checking used devices before resale.
+Linux hardware/function test for 3Dconnexion SpaceMouse devices, aimed at checking used devices.
 
 It checks:
 
