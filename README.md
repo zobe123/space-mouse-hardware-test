@@ -40,6 +40,24 @@ python spacemouse_test.py \
   --button-seconds 90
 ```
 
+Geräte anzeigen:
+
+```bash
+python spacemouse_test.py --list-devices
+```
+
+Falls der Button-Test das falsche `evdev`-Gerät erwischt:
+
+```bash
+python spacemouse_test.py --evdev /dev/input/event12
+```
+
+Ohne Button-Test:
+
+```bash
+python spacemouse_test.py --skip-buttons
+```
+
 Ohne ANSI-Farben:
 
 ```bash
@@ -80,6 +98,27 @@ Neutralstellung / Drift: PASS
 Tasten Press + Release: PASS
 GESAMTERGEBNIS: PASS
 ```
+
+## Troubleshooting
+
+Wenn `pyspacemouse` keine Geräte findet, zuerst prüfen:
+
+```bash
+pyspacemouse --list-hid
+pyspacemouse --list-connected
+pyspacemouse --test
+```
+
+Unter Linux sind häufig HID-/evdev-Berechtigungen das Problem. Für 3Dconnexion-Geräte kann eine udev-Regel für Vendor-ID `256f` helfen:
+
+```bash
+echo 'SUBSYSTEM=="hidraw", ATTRS{idVendor}=="256f", MODE="0660", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/50-spacemouse.rules
+echo 'SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="256f", MODE="0660", TAG+="uaccess"' | sudo tee -a /etc/udev/rules.d/50-spacemouse.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Danach SpaceMouse abziehen, wieder anstecken und das Terminal neu öffnen.
 
 ## Hinweis
 

@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import platform
 import select
 import statistics
@@ -28,7 +27,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import pyspacemouse
+try:
+    import pyspacemouse
+except ImportError:
+    pyspacemouse = None
+
 
 try:
     from evdev import InputDevice, list_devices, ecodes
@@ -38,7 +41,12 @@ except ImportError:
     ecodes = None
 
 AXES = ("x", "y", "z", "roll", "pitch", "yaw")
-LABEL = {"x":"X","y":"Y","z":"Z","roll":"Roll","pitch":"Pitch","yaw":"Yaw"}
+LABEL = {"x": "X", "y": "Y", "z": "Z", "roll": "Roll", "pitch": "Pitch", "yaw": "Yaw"}
+DEFAULT_NEUTRAL_SECONDS = 20
+DEFAULT_RANGE_SECONDS = 45
+DEFAULT_BUTTON_SECONDS = 60
+DEFAULT_NEUTRAL_WARN = 0.05
+DEFAULT_DIRECTION_TRIGGER = 0.10
 
 class C:
     enabled = True
@@ -71,6 +79,8 @@ def banner(title):
     print("=" * 64)
 
 def countdown(seconds=3):
+    if seconds <= 0:
+        return
     for n in range(seconds, 0, -1):
         print(f"Start in {n} ...", flush=True)
         time.sleep(1)
@@ -78,9 +88,15 @@ def countdown(seconds=3):
 def axis_values(state):
     return {a: float(getattr(state, a)) for a in AXES}
 
-def find_evdev_spacemouse():
+def find_evdev_spacemouse(path=None):
     if InputDevice is None:
         return None, "python-evdev ist nicht installiert"
+
+    if path:
+        try:
+            return InputDevice(path), None
+        except Exception as exc:
+            return None, f"evdev-Gerät {path!r} kann nicht geöffnet werden: {exc}"
 
     candidates = []
     for path in list_devices():
@@ -97,13 +113,48 @@ def find_evdev_spacemouse():
     if not candidates:
         return None, "Kein passendes evdev-Gerät gefunden"
 
+    def key_count(dev):
+        return len(dev.capabilities().get(ecodes.EV_KEY, []))
+
     with_keys = [d for d in candidates if ecodes.EV_KEY in d.capabilities()]
-    chosen = max(with_keys or candidates, key=lambda d: len(d.capabilities().get(ecodes.EV_KEY, [])))
+    chosen = max(with_keys or candidates, key=key_count)
     for d in candidates:
         if d is not chosen:
-            try: d.close()
-            except Exception: pass
+            try:
+                d.close()
+            except Exception:
+                pass
     return chosen, None
+
+def describe_evdev_device(dev):
+    if dev is None:
+        return None
+    return {
+        "path": getattr(dev, "path", None),
+        "name": getattr(dev, "name", None),
+        "phys": getattr(dev, "phys", None),
+        "uniq": getattr(dev, "uniq", None),
+    }
+
+def list_evdev_candidates():
+    if InputDevice is None:
+        return [], "python-evdev ist nicht installiert"
+
+    devices = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+            caps = dev.capabilities()
+            devices.append({
+                "path": path,
+                "name": dev.name,
+                "keys": len(caps.get(ecodes.EV_KEY, [])),
+                "axes": len(caps.get(ecodes.EV_ABS, [])),
+            })
+            dev.close()
+        except Exception as exc:
+            devices.append({"path": path, "error": str(exc)})
+    return devices, None
 
 def key_name(code):
     if ecodes is None:
@@ -113,14 +164,14 @@ def key_name(code):
         name = "/".join(name)
     return name or f"KEY_{code}"
 
-def neutral_test(dev, seconds):
+def neutral_test(dev, seconds, countdown_seconds):
     clear()
     banner("TEST 1/3 – NEUTRAL / DRIFT")
     print()
     print(red("NICHT BERÜHREN"))
     print(f"SpaceMouse auf eine feste Unterlage stellen und {seconds} Sekunden nicht anfassen.")
     print()
-    countdown()
+    countdown(countdown_seconds)
 
     samples = {a: [] for a in AXES}
     start = time.monotonic()
@@ -162,7 +213,7 @@ def show_neutral_result(neutral, threshold):
     print(green("Neutraltest bestanden") if all(neutral[a]["max_abs"] < threshold for a in AXES)
           else yellow("Neutraltest enthält auffällige Werte"))
 
-def range_test(dev, timeout, trigger):
+def range_test(dev, timeout, trigger, countdown_seconds):
     clear()
     banner("TEST 2/3 – 6DoF BEWEGUNG")
     print()
@@ -180,7 +231,7 @@ def range_test(dev, timeout, trigger):
     print()
     print(yellow("Wichtig: Bei Z die Kappe auch aktiv HOCHZIEHEN."))
     print()
-    countdown()
+    countdown(countdown_seconds)
 
     mins = {a: 1.0 for a in AXES}
     maxs = {a: -1.0 for a in AXES}
@@ -189,6 +240,7 @@ def range_test(dev, timeout, trigger):
 
     start = time.monotonic()
     last_render = 0.0
+    rendered_lines = 0
 
     while True:
         state = dev.read()
@@ -205,9 +257,10 @@ def range_test(dev, timeout, trigger):
         complete = all(seen_neg[a] and seen_pos[a] for a in AXES)
         expired = now - start >= timeout
 
-        if now - last_render >= 0.08:
-            # rewrite a compact live checklist
-            print("\033[8A" if sys.stdout.isatty() else "", end="")
+        render_interval = 0.08 if sys.stdout.isatty() else 2.0
+        if now - last_render >= render_interval:
+            if sys.stdout.isatty() and rendered_lines:
+                print(f"\033[{rendered_lines}A", end="")
             print("Noch zu testen / Status:")
             for a in AXES:
                 n = green("OK -") if seen_neg[a] else red("FEHLT -")
@@ -222,6 +275,7 @@ def range_test(dev, timeout, trigger):
                 hint.append("Z-: Kappe DRÜCKEN")
             print((yellow("Hinweis: " + " | ".join(hint)) if hint else " " * 50))
             last_render = now
+            rendered_lines = 9
 
         if complete or expired:
             break
@@ -239,7 +293,7 @@ def range_test(dev, timeout, trigger):
         }
     return result
 
-def button_test(dev, timeout):
+def button_test(dev, timeout, countdown_seconds):
     clear()
     banner("TEST 3/3 – TASTEN")
     print()
@@ -248,24 +302,33 @@ def button_test(dev, timeout):
         return {"available": False, "expected_codes": [], "completed": [], "complete": False}
 
     expected = sorted(int(code) for code in dev.capabilities().get(ecodes.EV_KEY, []))
+    if not expected:
+        print(yellow("Dieses evdev-Gerät meldet keine Tasten-Codes."))
+        return {"available": True, "expected_codes": [], "completed": [], "complete": False}
+
     print(f"Linux meldet {len(expected)} Tasten-Codes für dieses Gerät.")
     print("Drücke jede Taste einmal vollständig und lasse sie wieder los.")
     print()
-    countdown()
+    countdown(countdown_seconds)
 
     pressed, released = set(), set()
     start = time.monotonic()
 
     while True:
-        ready, _, _ = select.select([dev.fd], [], [], 0.15)
-        if ready:
-            for event in dev.read():
-                if event.type != ecodes.EV_KEY:
-                    continue
-                if event.value == 1:
-                    pressed.add(int(event.code))
-                elif event.value == 0:
-                    released.add(int(event.code))
+        try:
+            ready, _, _ = select.select([dev.fd], [], [], 0.15)
+            if ready:
+                for event in dev.read():
+                    if event.type != ecodes.EV_KEY:
+                        continue
+                    if event.value == 1:
+                        pressed.add(int(event.code))
+                    elif event.value == 0:
+                        released.add(int(event.code))
+        except OSError as exc:
+            print()
+            print(red(f"evdev-Lesefehler: {exc}"))
+            break
 
         completed = pressed & released
         remaining_codes = [c for c in expected if c not in completed]
@@ -304,10 +367,11 @@ def button_test(dev, timeout):
 def axis_status(d, trigger):
     return "OK" if d["min"] <= -trigger and d["max"] >= trigger else "CHECK"
 
-def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger):
+def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, system_info):
     neutral_ok = all(neutral[a]["max_abs"] < neutral_warn for a in AXES)
     range_ok = all(axis_status(ranges[a], trigger) == "OK" for a in AXES)
-    button_ok = bool(buttons.get("complete"))
+    button_skipped = bool(buttons.get("skipped"))
+    button_ok = bool(buttons.get("complete")) and not button_skipped
     overall = neutral_ok and range_ok and button_ok
 
     L = []
@@ -316,6 +380,9 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger):
     L.append(f"Gerät: {device_name}")
     L.append(f"Datum: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     L.append("Test: Linux / Raw HID + evdev")
+    L.append(f"System: {system_info['platform']}")
+    L.append(f"Python: {system_info['python']}")
+    L.append(f"Schwellwerte: neutral<{neutral_warn:.4f}, richtung>={trigger:.4f}")
     L.append("")
     L.append("6DoF-Sensor – Neutralstellung")
     L.append("--------------------------------")
@@ -334,7 +401,10 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger):
     L.append("")
     L.append("Tasten")
     L.append("--------------------------------")
-    if buttons.get("available"):
+    if button_skipped:
+        L.append("Button-Test übersprungen.")
+        L.append("Status: SKIPPED")
+    elif buttons.get("available"):
         exp=len(buttons.get("expected_codes", []))
         done=len(buttons.get("completed", []))
         L.append(f"Vom Linux-Gerät gemeldete Tasten: {exp}")
@@ -347,23 +417,98 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger):
     L.append("--------------------------------")
     L.append(f"Neutralstellung / Drift: {'PASS' if neutral_ok else 'CHECK'}")
     L.append(f"6 Achsen / 12 Richtungen: {'PASS' if range_ok else 'CHECK'}")
-    L.append(f"Tasten Press + Release: {'PASS' if button_ok else 'CHECK'}")
+    if button_skipped:
+        L.append("Tasten Press + Release: SKIPPED")
+    else:
+        L.append(f"Tasten Press + Release: {'PASS' if button_ok else 'CHECK'}")
     L.append(f"GESAMTERGEBNIS: {'PASS' if overall else 'CHECK'}")
     L.append("")
     L.append("Hinweis: Unabhängiger Funktionstest; kein offizielles 3Dconnexion-Diagnose- oder Kalibrierprotokoll.")
     return "\n".join(L), overall
 
-def main():
-    p=argparse.ArgumentParser()
-    p.add_argument("--neutral-seconds", type=int, default=20)
-    p.add_argument("--range-seconds", type=int, default=45)
-    p.add_argument("--button-seconds", type=int, default=60)
-    p.add_argument("--neutral-warn", type=float, default=0.05)
-    p.add_argument("--direction-trigger", type=float, default=0.10)
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("muss eine Ganzzahl sein") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("muss 0 oder größer sein")
+    return parsed
+
+def positive_float(value):
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("muss eine Zahl sein") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("muss größer als 0 sein")
+    return parsed
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Interaktiver Linux-Hardwaretest für 3Dconnexion SpaceMouse-Geräte.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--neutral-seconds", type=positive_int, default=DEFAULT_NEUTRAL_SECONDS)
+    p.add_argument("--range-seconds", type=positive_int, default=DEFAULT_RANGE_SECONDS)
+    p.add_argument("--button-seconds", type=positive_int, default=DEFAULT_BUTTON_SECONDS)
+    p.add_argument("--countdown-seconds", type=positive_int, default=3)
+    p.add_argument("--neutral-warn", type=positive_float, default=DEFAULT_NEUTRAL_WARN)
+    p.add_argument("--direction-trigger", type=positive_float, default=DEFAULT_DIRECTION_TRIGGER)
     p.add_argument("--output-dir", default="./reports")
+    p.add_argument("--evdev", help="evdev-Pfad für den Button-Test, z.B. /dev/input/event12")
+    p.add_argument("--skip-buttons", action="store_true", help="Button-Test überspringen")
+    p.add_argument("--list-devices", action="store_true", help="erkannte pyspacemouse-/evdev-Geräte ausgeben und beenden")
     p.add_argument("--no-color", action="store_true")
-    args=p.parse_args()
+    return p
+
+def print_device_list():
+    print("pyspacemouse:")
+    if pyspacemouse is None:
+        print("  nicht installiert")
+    else:
+        try:
+            devices = pyspacemouse.get_connected_devices()
+        except Exception as exc:
+            print(f"  Fehler: {exc}")
+        else:
+            if devices:
+                for dev in devices:
+                    print(f"  - {dev}")
+            else:
+                print("  keine Geräte gemeldet")
+
+    print()
+    print("evdev:")
+    devices, error = list_evdev_candidates()
+    if error:
+        print(f"  {error}")
+        return
+    if not devices:
+        print("  keine Geräte gemeldet")
+        return
+    for dev in devices:
+        if "error" in dev:
+            print(f"  - {dev['path']}: {dev['error']}")
+        else:
+            print(f"  - {dev['path']}: {dev['name']} (keys={dev['keys']}, axes={dev['axes']})")
+
+def fail(message, code=1):
+    sys.stdout.flush()
+    print(red(message), file=sys.stderr)
+    return code
+
+def main():
+    p = build_parser()
+    args = p.parse_args()
     C.enabled = (not args.no_color) and sys.stdout.isatty()
+
+    if args.list_devices:
+        print_device_list()
+        return 0
+
+    if pyspacemouse is None:
+        return fail("pyspacemouse ist nicht installiert. Bitte zuerst `pip install -r requirements.txt` ausführen.")
 
     clear()
     banner("3Dconnexion SpaceMouse Hardware Test")
@@ -379,34 +524,59 @@ def main():
     except Exception:
         connected=[]
 
-    evdev_dev, evdev_error = find_evdev_spacemouse()
-    if evdev_error:
-        print(yellow(f"evdev: {evdev_error}"))
+    evdev_dev = None
+    if not args.skip_buttons:
+        evdev_dev, evdev_error = find_evdev_spacemouse(args.evdev)
+        if evdev_error:
+            print(yellow(f"evdev: {evdev_error}"))
+    evdev_info = describe_evdev_device(evdev_dev)
 
-    with pyspacemouse.open() as dev:
-        device_name = getattr(dev, "name", None) or (connected[0] if connected else "3Dconnexion SpaceMouse")
-        neutral = neutral_test(dev, args.neutral_seconds)
-        show_neutral_result(neutral, args.neutral_warn)
-        input("\nEnter für TEST 2 ...")
-        ranges = range_test(dev, args.range_seconds, args.direction_trigger)
+    try:
+        with pyspacemouse.open() as dev:
+            device_name = getattr(dev, "name", None) or (connected[0] if connected else "3Dconnexion SpaceMouse")
+            neutral = neutral_test(dev, args.neutral_seconds, args.countdown_seconds)
+            show_neutral_result(neutral, args.neutral_warn)
+            input("\nEnter für TEST 2 ...")
+            ranges = range_test(dev, args.range_seconds, args.direction_trigger, args.countdown_seconds)
 
-    input("\nEnter für TEST 3 ...")
-    buttons = button_test(evdev_dev, args.button_seconds)
-    if evdev_dev:
-        try: evdev_dev.close()
-        except Exception: pass
+        if args.skip_buttons:
+            buttons = {"available": False, "skipped": True, "expected_codes": [], "completed": [], "complete": False}
+        else:
+            input("\nEnter für TEST 3 ...")
+            buttons = button_test(evdev_dev, args.button_seconds, args.countdown_seconds)
+    except KeyboardInterrupt:
+        print()
+        return fail("Abgebrochen.", 130)
+    except Exception as exc:
+        return fail(f"SpaceMouse konnte nicht geöffnet oder gelesen werden: {exc}")
+    finally:
+        if evdev_dev:
+            try:
+                evdev_dev.close()
+            except Exception:
+                pass
 
-    report, overall = build_report(device_name, neutral, ranges, buttons, args.neutral_warn, args.direction_trigger)
+    system_info = {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "evdev": evdev_info,
+    }
+    report, overall = build_report(device_name, neutral, ranges, buttons, args.neutral_warn, args.direction_trigger, system_info)
 
-    outdir=Path(args.output_dir)
+    outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    stamp=datetime.now().strftime("%Y%m%d-%H%M%S")
-    txt=outdir/f"spacemouse-test-{stamp}.txt"
-    js=outdir/f"spacemouse-test-{stamp}.json"
-    txt.write_text(report+"\n", encoding="utf-8")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    txt = outdir / f"spacemouse-test-{stamp}.txt"
+    js = outdir / f"spacemouse-test-{stamp}.json"
+    txt.write_text(report + "\n", encoding="utf-8")
     js.write_text(json.dumps({
         "generated_at": datetime.now().astimezone().isoformat(),
         "device": str(device_name),
+        "system": system_info,
+        "thresholds": {
+            "neutral_warn": args.neutral_warn,
+            "direction_trigger": args.direction_trigger,
+        },
         "neutral": neutral,
         "range": ranges,
         "buttons": buttons,
