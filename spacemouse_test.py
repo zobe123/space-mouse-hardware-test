@@ -49,6 +49,7 @@ DEFAULT_NEUTRAL_WARN = 0.05
 DEFAULT_DIRECTION_TRIGGER = 0.10
 DEFAULT_DIRECTION_SAMPLES = 3
 DEFAULT_RANGE_MIN_SECONDS = 20
+DEFAULT_PEAK_TARGET = 0.90
 
 class C:
     enabled = True
@@ -89,6 +90,12 @@ def countdown(seconds=3):
 
 def axis_values(state):
     return {a: float(getattr(state, a)) for a in AXES}
+
+def negative_peak(value):
+    return abs(value) if value < 0 else 0.0
+
+def positive_peak(value):
+    return value if value > 0 else 0.0
 
 def find_evdev_spacemouse(path=None):
     if InputDevice is None:
@@ -230,12 +237,13 @@ def show_neutral_result(neutral, threshold):
     print(green("Neutraltest bestanden") if all(neutral[a]["max_abs"] < threshold for a in AXES)
           else yellow("Neutraltest enthält auffällige Werte"))
 
-def range_test(dev, timeout, min_seconds, trigger, required_samples, countdown_seconds):
+def range_test(dev, timeout, min_seconds, trigger, peak_target, required_samples, countdown_seconds):
     clear()
     banner("TEST 2/3 – 6DoF BEWEGUNG")
     print()
     print("Führe ALLE Bewegungen deutlich in BEIDE Richtungen aus.")
     print(f"Eine Richtung zählt erst ab {required_samples} Messwerten über dem Schwellwert.")
+    print(f"Für MAX muss der Ausschlag mindestens {peak_target:.2f} erreichen.")
     print(f"Der Test läuft mindestens {min(timeout, min_seconds)} Sekunden, damit echte Maximalwerte sichtbar werden.")
     print()
     print("Translation:")
@@ -277,7 +285,11 @@ def range_test(dev, timeout, min_seconds, trigger, required_samples, countdown_s
             seen_pos[a] = pos_hits[a] >= required_samples
 
         now = time.monotonic()
-        complete = all(seen_neg[a] and seen_pos[a] for a in AXES)
+        peak_neg = {a: negative_peak(mins[a]) for a in AXES}
+        peak_pos = {a: positive_peak(maxs[a]) for a in AXES}
+        max_neg = {a: peak_neg[a] >= peak_target for a in AXES}
+        max_pos = {a: peak_pos[a] >= peak_target for a in AXES}
+        complete = all(max_neg[a] and max_pos[a] for a in AXES)
         min_runtime_done = now - start >= min(timeout, min_seconds)
         expired = now - start >= timeout
 
@@ -287,10 +299,11 @@ def range_test(dev, timeout, min_seconds, trigger, required_samples, countdown_s
                 print(f"\033[{rendered_lines}A", end="")
             print("Noch zu testen / Status:")
             for a in AXES:
-                n = green("OK -") if seen_neg[a] else red("FEHLT -")
-                p = green("OK +") if seen_pos[a] else red("FEHLT +")
+                n = green("MAX -") if max_neg[a] else yellow("SEEN -") if seen_neg[a] else red("FEHLT -")
+                p = green("MAX +") if max_pos[a] else yellow("SEEN +") if seen_pos[a] else red("FEHLT +")
                 hits = f"{neg_hits[a]}/{required_samples} {pos_hits[a]}/{required_samples}"
-                print(f"  {LABEL[a]:<6} {n:<18} {p:<18}  live={vals[a]:+0.2f}  hits={hits}")
+                peaks = f"{peak_neg[a]:.2f}/{peak_pos[a]:.2f}"
+                print(f"  {LABEL[a]:<6} {n:<18} {p:<18} live={vals[a]:+0.2f} peak- / +={peaks} hits={hits}")
             remaining = max(0, int(timeout - (now-start)))
             min_remaining = max(0, int(min(timeout, min_seconds) - (now-start)))
             print(f"Restzeit: {remaining:2d}s | Mindestlaufzeit: {min_remaining:2d}s")
@@ -316,6 +329,10 @@ def range_test(dev, timeout, min_seconds, trigger, required_samples, countdown_s
             "span": maxs[a] - mins[a],
             "negative_seen": seen_neg[a],
             "positive_seen": seen_pos[a],
+            "negative_peak": negative_peak(mins[a]),
+            "positive_peak": positive_peak(maxs[a]),
+            "negative_max_seen": negative_peak(mins[a]) >= peak_target,
+            "positive_max_seen": positive_peak(maxs[a]) >= peak_target,
             "negative_hits": neg_hits[a],
             "positive_hits": pos_hits[a],
         }
@@ -453,12 +470,12 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None, grab=T
         "complete": not remaining_codes and not still_pressed,
     }
 
-def axis_status(d, trigger):
-    return "OK" if d["min"] <= -trigger and d["max"] >= trigger else "CHECK"
+def axis_status(d, peak_target):
+    return "OK" if d["negative_peak"] >= peak_target and d["positive_peak"] >= peak_target else "CHECK"
 
-def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, system_info):
+def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, peak_target, system_info):
     neutral_ok = all(neutral[a]["max_abs"] < neutral_warn for a in AXES)
-    range_ok = all(axis_status(ranges[a], trigger) == "OK" for a in AXES)
+    range_ok = all(axis_status(ranges[a], peak_target) == "OK" for a in AXES)
     button_skipped = bool(buttons.get("skipped"))
     button_ok = bool(buttons.get("complete")) and not button_skipped
     overall = neutral_ok and range_ok and button_ok
@@ -471,7 +488,7 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, s
     L.append("Test: Linux / Raw HID + evdev")
     L.append(f"System: {system_info['platform']}")
     L.append(f"Python: {system_info['python']}")
-    L.append(f"Schwellwerte: neutral<{neutral_warn:.4f}, richtung>={trigger:.4f}")
+    L.append(f"Schwellwerte: neutral<{neutral_warn:.4f}, richtung>={trigger:.4f}, max>={peak_target:.4f}")
     L.append("")
     L.append("6DoF-Sensor – Neutralstellung")
     L.append("--------------------------------")
@@ -483,10 +500,13 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, s
     L.append("")
     L.append("6DoF-Sensor – Bewegungsbereich")
     L.append("--------------------------------")
-    L.append(f"{'Achse':<8} {'Min':>9} {'Max':>9} {'Span':>9} {'Status':>8}")
+    L.append(f"{'Achse':<8} {'Min':>9} {'Max':>9} {'Peak-':>9} {'Peak+':>9} {'Status':>8}")
     for a in AXES:
         d=ranges[a]
-        L.append(f"{LABEL[a]:<8} {d['min']:>+9.4f} {d['max']:>+9.4f} {d['span']:>9.4f} {axis_status(d, trigger):>8}")
+        L.append(
+            f"{LABEL[a]:<8} {d['min']:>+9.4f} {d['max']:>+9.4f} "
+            f"{d['negative_peak']:>9.4f} {d['positive_peak']:>9.4f} {axis_status(d, peak_target):>8}"
+        )
     L.append("")
     L.append("Tasten")
     L.append("--------------------------------")
@@ -529,6 +549,12 @@ def positive_int(value):
         raise argparse.ArgumentTypeError("muss größer als 0 sein")
     return parsed
 
+def unit_float(value):
+    parsed = positive_float(value)
+    if parsed > 1.0:
+        raise argparse.ArgumentTypeError("muss zwischen 0 und 1 liegen")
+    return parsed
+
 def non_negative_int(value):
     try:
         parsed = int(value)
@@ -559,6 +585,7 @@ def build_parser():
     p.add_argument("--countdown-seconds", type=non_negative_int, default=3)
     p.add_argument("--neutral-warn", type=positive_float, default=DEFAULT_NEUTRAL_WARN)
     p.add_argument("--direction-trigger", type=positive_float, default=DEFAULT_DIRECTION_TRIGGER)
+    p.add_argument("--peak-target", type=unit_float, default=DEFAULT_PEAK_TARGET)
     p.add_argument("--direction-samples", type=positive_int, default=DEFAULT_DIRECTION_SAMPLES)
     p.add_argument("--output-dir", default="./reports")
     p.add_argument("--evdev", help="evdev-Pfad für den Button-Test, z.B. /dev/input/event12")
@@ -649,6 +676,7 @@ def main():
                 args.range_seconds,
                 args.range_min_seconds,
                 args.direction_trigger,
+                args.peak_target,
                 args.direction_samples,
                 args.countdown_seconds,
             )
@@ -681,7 +709,16 @@ def main():
         "python": platform.python_version(),
         "evdev": evdev_info,
     }
-    report, overall = build_report(device_name, neutral, ranges, buttons, args.neutral_warn, args.direction_trigger, system_info)
+    report, overall = build_report(
+        device_name,
+        neutral,
+        ranges,
+        buttons,
+        args.neutral_warn,
+        args.direction_trigger,
+        args.peak_target,
+        system_info,
+    )
 
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -696,6 +733,7 @@ def main():
         "thresholds": {
             "neutral_warn": args.neutral_warn,
             "direction_trigger": args.direction_trigger,
+            "peak_target": args.peak_target,
             "direction_samples": args.direction_samples,
             "range_min_seconds": args.range_min_seconds,
         },
