@@ -759,6 +759,7 @@ def main():
     }
     report, overall = build_report(
         device_name,
+        serial_number,
         neutral,
         ranges,
         buttons,
