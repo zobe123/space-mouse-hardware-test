@@ -128,6 +128,13 @@ reports/spacemouse-test-YYYYMMDD-HHMMSS.txt
 reports/spacemouse-test-YYYYMMDD-HHMMSS.json
 ```
 
+Wenn HID/evdev eine Seriennummer oder `uniq`-ID meldet, wird sie im Report und im Dateinamen verwendet:
+
+```text
+reports/spacemouse-test-SERIENNUMMER-YYYYMMDD-HHMMSS.txt
+reports/spacemouse-test-SERIENNUMMER-YYYYMMDD-HHMMSS.json
+```
+
 Beispiel:
 
 ```text

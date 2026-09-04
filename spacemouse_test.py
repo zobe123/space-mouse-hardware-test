@@ -20,6 +20,7 @@ import argparse
 import json
 import math
 import platform
+import re
 import select
 import statistics
 import sys
@@ -159,6 +160,7 @@ def list_evdev_candidates():
             devices.append({
                 "path": path,
                 "name": dev.name,
+                "uniq": getattr(dev, "uniq", None),
                 "keys": len(caps.get(ecodes.EV_KEY, [])),
                 "axes": len(caps.get(ecodes.EV_ABS, [])),
             })
@@ -187,6 +189,49 @@ def print_key_list(title, codes):
     print(title)
     for code in sorted(codes):
         print(f"  - {code} ({key_name(code)})")
+
+def first_attr_value(obj, attr_names):
+    if obj is None:
+        return None
+    for attr in attr_names:
+        try:
+            value = getattr(obj, attr, None)
+        except Exception:
+            continue
+        if value:
+            return str(value)
+    return None
+
+def find_device_serial(dev, connected_devices, evdev_info):
+    attr_names = ("serial_number", "serial", "sn", "uniq", "unique_id")
+    serial = first_attr_value(dev, attr_names)
+    if serial:
+        return serial
+
+    for nested_attr in ("device", "hid_device", "hid", "_device"):
+        try:
+            nested = getattr(dev, nested_attr, None)
+        except Exception:
+            nested = None
+        serial = first_attr_value(nested, attr_names)
+        if serial:
+            return serial
+
+    for connected in connected_devices or []:
+        serial = first_attr_value(connected, attr_names)
+        if serial:
+            return serial
+
+    if evdev_info and evdev_info.get("uniq"):
+        return str(evdev_info["uniq"])
+
+    return None
+
+def filename_part(value):
+    if not value:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value)).strip("-._")
+    return cleaned or None
 
 def neutral_test(dev, seconds, countdown_seconds):
     clear()
@@ -473,7 +518,7 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None, grab=T
 def axis_status(d, peak_target):
     return "OK" if d["negative_peak"] >= peak_target and d["positive_peak"] >= peak_target else "CHECK"
 
-def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, peak_target, system_info):
+def build_report(device_name, serial_number, neutral, ranges, buttons, neutral_warn, trigger, peak_target, system_info):
     neutral_ok = all(neutral[a]["max_abs"] < neutral_warn for a in AXES)
     range_ok = all(axis_status(ranges[a], peak_target) == "OK" for a in AXES)
     button_skipped = bool(buttons.get("skipped"))
@@ -484,6 +529,7 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, p
     L.append("3Dconnexion SpaceMouse – Hardwaretest")
     L.append("="*43)
     L.append(f"Gerät: {device_name}")
+    L.append(f"Seriennummer: {serial_number or 'nicht gemeldet'}")
     L.append(f"Datum: {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}")
     L.append("Test: Linux / Raw HID + evdev")
     L.append(f"System: {system_info['platform']}")
@@ -624,7 +670,8 @@ def print_device_list():
         if "error" in dev:
             print(f"  - {dev['path']}: {dev['error']}")
         else:
-            print(f"  - {dev['path']}: {dev['name']} (keys={dev['keys']}, axes={dev['axes']})")
+            uniq = f", uniq={dev['uniq']}" if dev.get("uniq") else ""
+            print(f"  - {dev['path']}: {dev['name']} (keys={dev['keys']}, axes={dev['axes']}{uniq})")
 
 def fail(message, code=1):
     sys.stdout.flush()
@@ -668,6 +715,7 @@ def main():
     try:
         with pyspacemouse.open() as dev:
             device_name = getattr(dev, "name", None) or (connected[0] if connected else "3Dconnexion SpaceMouse")
+            serial_number = find_device_serial(dev, connected, evdev_info)
             neutral = neutral_test(dev, args.neutral_seconds, args.countdown_seconds)
             show_neutral_result(neutral, args.neutral_warn)
             input("\nEnter für TEST 2 ...")
@@ -723,12 +771,15 @@ def main():
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    txt = outdir / f"spacemouse-test-{stamp}.txt"
-    js = outdir / f"spacemouse-test-{stamp}.json"
+    serial_slug = filename_part(serial_number)
+    name_base = f"spacemouse-test-{serial_slug}-{stamp}" if serial_slug else f"spacemouse-test-{stamp}"
+    txt = outdir / f"{name_base}.txt"
+    js = outdir / f"{name_base}.json"
     txt.write_text(report + "\n", encoding="utf-8")
     js.write_text(json.dumps({
         "generated_at": datetime.now().astimezone().isoformat(),
         "device": str(device_name),
+        "serial_number": serial_number,
         "system": system_info,
         "thresholds": {
             "neutral_warn": args.neutral_warn,
