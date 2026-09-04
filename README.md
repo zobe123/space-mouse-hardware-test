@@ -37,6 +37,8 @@ Optional:
 python spacemouse_test.py \
   --neutral-seconds 30 \
   --range-seconds 60 \
+  --range-min-seconds 20 \
+  --direction-samples 3 \
   --button-seconds 90
 ```
 
@@ -80,6 +82,19 @@ Z+ : Kappe HOCHZIEHEN
 ```
 
 Der Bewegungstest kann automatisch beendet werden, sobald alle 12 Richtungen erkannt wurden.
+Standardmäßig zählt eine Richtung erst nach 3 Messwerten über dem Schwellwert und der Bewegungstest läuft mindestens 20 Sekunden.
+
+Wenn der Test zu schnell durchläuft:
+
+```bash
+python spacemouse_test.py --range-seconds 90 --range-min-seconds 45 --direction-samples 5
+```
+
+Wenn du bewusst nur stärkere Ausschläge zählen willst:
+
+```bash
+python spacemouse_test.py --direction-trigger 0.20
+```
 
 ## Ergebnis
 
@@ -119,6 +134,20 @@ sudo udevadm trigger
 ```
 
 Danach SpaceMouse abziehen, wieder anstecken und das Terminal neu öffnen.
+
+Wenn nur der Button-Test nicht verfügbar ist:
+
+```bash
+python spacemouse_test.py --list-devices
+```
+
+Suche in der `evdev`-Liste nach dem SpaceMouse-/3Dconnexion-Gerät. Wenn es nicht automatisch erkannt wird, den passenden Pfad manuell angeben:
+
+```bash
+python spacemouse_test.py --evdev /dev/input/event12
+```
+
+Wenn kein passendes `evdev`-Gerät auftaucht, ist die SpaceMouse wahrscheinlich noch nicht als Linux-Input-Gerät verfügbar oder die Berechtigungen fehlen. Mit USB/IP muss das Gerät auf dem Testrechner wirklich per `usbip attach` eingebunden sein, nicht nur auf dem entfernten Rechner sichtbar.
 
 ## Hinweis
 

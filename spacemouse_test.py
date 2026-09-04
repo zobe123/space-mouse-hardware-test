@@ -47,6 +47,8 @@ DEFAULT_RANGE_SECONDS = 45
 DEFAULT_BUTTON_SECONDS = 60
 DEFAULT_NEUTRAL_WARN = 0.05
 DEFAULT_DIRECTION_TRIGGER = 0.10
+DEFAULT_DIRECTION_SAMPLES = 3
+DEFAULT_RANGE_MIN_SECONDS = 20
 
 class C:
     enabled = True
@@ -99,6 +101,7 @@ def find_evdev_spacemouse(path=None):
             return None, f"evdev-Gerät {path!r} kann nicht geöffnet werden: {exc}"
 
     candidates = []
+    errors = []
     for path in list_devices():
         try:
             dev = InputDevice(path)
@@ -107,11 +110,12 @@ def find_evdev_spacemouse(path=None):
                 candidates.append(dev)
             else:
                 dev.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
 
     if not candidates:
-        return None, "Kein passendes evdev-Gerät gefunden"
+        detail = f" Fehler beim Lesen: {'; '.join(errors)}" if errors else ""
+        return None, "Kein passendes evdev-Gerät gefunden. Prüfe `--list-devices` oder gib mit `--evdev /dev/input/eventX` das Gerät manuell an." + detail
 
     def key_count(dev):
         return len(dev.capabilities().get(ecodes.EV_KEY, []))
@@ -213,11 +217,13 @@ def show_neutral_result(neutral, threshold):
     print(green("Neutraltest bestanden") if all(neutral[a]["max_abs"] < threshold for a in AXES)
           else yellow("Neutraltest enthält auffällige Werte"))
 
-def range_test(dev, timeout, trigger, countdown_seconds):
+def range_test(dev, timeout, min_seconds, trigger, required_samples, countdown_seconds):
     clear()
     banner("TEST 2/3 – 6DoF BEWEGUNG")
     print()
-    print("Führe ALLE Bewegungen mindestens einmal deutlich in BEIDE Richtungen aus.")
+    print("Führe ALLE Bewegungen deutlich in BEIDE Richtungen aus.")
+    print(f"Eine Richtung zählt erst ab {required_samples} Messwerten über dem Schwellwert.")
+    print(f"Der Test läuft mindestens {min(timeout, min_seconds)} Sekunden, damit echte Maximalwerte sichtbar werden.")
     print()
     print("Translation:")
     print("  X:  <- LINKS          RECHTS ->")
@@ -235,6 +241,8 @@ def range_test(dev, timeout, trigger, countdown_seconds):
 
     mins = {a: 1.0 for a in AXES}
     maxs = {a: -1.0 for a in AXES}
+    neg_hits = {a: 0 for a in AXES}
+    pos_hits = {a: 0 for a in AXES}
     seen_neg = {a: False for a in AXES}
     seen_pos = {a: False for a in AXES}
 
@@ -249,12 +257,15 @@ def range_test(dev, timeout, trigger, countdown_seconds):
             mins[a] = min(mins[a], vals[a])
             maxs[a] = max(maxs[a], vals[a])
             if vals[a] <= -trigger:
-                seen_neg[a] = True
+                neg_hits[a] += 1
             if vals[a] >= trigger:
-                seen_pos[a] = True
+                pos_hits[a] += 1
+            seen_neg[a] = neg_hits[a] >= required_samples
+            seen_pos[a] = pos_hits[a] >= required_samples
 
         now = time.monotonic()
         complete = all(seen_neg[a] and seen_pos[a] for a in AXES)
+        min_runtime_done = now - start >= min(timeout, min_seconds)
         expired = now - start >= timeout
 
         render_interval = 0.08 if sys.stdout.isatty() else 2.0
@@ -265,9 +276,11 @@ def range_test(dev, timeout, trigger, countdown_seconds):
             for a in AXES:
                 n = green("OK -") if seen_neg[a] else red("FEHLT -")
                 p = green("OK +") if seen_pos[a] else red("FEHLT +")
-                print(f"  {LABEL[a]:<6} {n:<18} {p:<18}  live={vals[a]:+0.2f}")
+                hits = f"{neg_hits[a]}/{required_samples} {pos_hits[a]}/{required_samples}"
+                print(f"  {LABEL[a]:<6} {n:<18} {p:<18}  live={vals[a]:+0.2f}  hits={hits}")
             remaining = max(0, int(timeout - (now-start)))
-            print(f"Restzeit: {remaining:2d}s")
+            min_remaining = max(0, int(min(timeout, min_seconds) - (now-start)))
+            print(f"Restzeit: {remaining:2d}s | Mindestlaufzeit: {min_remaining:2d}s")
             hint = []
             if not seen_pos["z"]:
                 hint.append("Z+: Kappe HOCHZIEHEN")
@@ -277,7 +290,7 @@ def range_test(dev, timeout, trigger, countdown_seconds):
             last_render = now
             rendered_lines = 9
 
-        if complete or expired:
+        if (complete and min_runtime_done) or expired:
             break
         time.sleep(0.002)
 
@@ -290,21 +303,38 @@ def range_test(dev, timeout, trigger, countdown_seconds):
             "span": maxs[a] - mins[a],
             "negative_seen": seen_neg[a],
             "positive_seen": seen_pos[a],
+            "negative_hits": neg_hits[a],
+            "positive_hits": pos_hits[a],
         }
     return result
 
-def button_test(dev, timeout, countdown_seconds):
+def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
     clear()
     banner("TEST 3/3 – TASTEN")
     print()
     if dev is None:
         print(red("Button-Test nicht verfügbar."))
-        return {"available": False, "expected_codes": [], "completed": [], "complete": False}
+        if unavailable_reason:
+            print(yellow(unavailable_reason))
+        print("Tipp: `python spacemouse_test.py --list-devices` ausführen und ggf. mit `--evdev /dev/input/eventX` starten.")
+        return {
+            "available": False,
+            "error": unavailable_reason,
+            "expected_codes": [],
+            "completed": [],
+            "complete": False,
+        }
 
     expected = sorted(int(code) for code in dev.capabilities().get(ecodes.EV_KEY, []))
     if not expected:
         print(yellow("Dieses evdev-Gerät meldet keine Tasten-Codes."))
-        return {"available": True, "expected_codes": [], "completed": [], "complete": False}
+        return {
+            "available": True,
+            "error": "evdev-Gerät meldet keine Tasten-Codes",
+            "expected_codes": [],
+            "completed": [],
+            "complete": False,
+        }
 
     print(f"Linux meldet {len(expected)} Tasten-Codes für dieses Gerät.")
     print("Drücke jede Taste einmal vollständig und lasse sie wieder los.")
@@ -412,6 +442,8 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, s
         L.append("Status: " + ("OK" if button_ok else "CHECK"))
     else:
         L.append("Button-Test nicht verfügbar.")
+        if buttons.get("error"):
+            L.append(f"Grund: {buttons['error']}")
     L.append("")
     L.append("Zusammenfassung")
     L.append("--------------------------------")
@@ -427,6 +459,15 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, s
     return "\n".join(L), overall
 
 def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("muss eine Ganzzahl sein") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("muss größer als 0 sein")
+    return parsed
+
+def non_negative_int(value):
     try:
         parsed = int(value)
     except ValueError as exc:
@@ -451,10 +492,12 @@ def build_parser():
     )
     p.add_argument("--neutral-seconds", type=positive_int, default=DEFAULT_NEUTRAL_SECONDS)
     p.add_argument("--range-seconds", type=positive_int, default=DEFAULT_RANGE_SECONDS)
+    p.add_argument("--range-min-seconds", type=positive_int, default=DEFAULT_RANGE_MIN_SECONDS)
     p.add_argument("--button-seconds", type=positive_int, default=DEFAULT_BUTTON_SECONDS)
-    p.add_argument("--countdown-seconds", type=positive_int, default=3)
+    p.add_argument("--countdown-seconds", type=non_negative_int, default=3)
     p.add_argument("--neutral-warn", type=positive_float, default=DEFAULT_NEUTRAL_WARN)
     p.add_argument("--direction-trigger", type=positive_float, default=DEFAULT_DIRECTION_TRIGGER)
+    p.add_argument("--direction-samples", type=positive_int, default=DEFAULT_DIRECTION_SAMPLES)
     p.add_argument("--output-dir", default="./reports")
     p.add_argument("--evdev", help="evdev-Pfad für den Button-Test, z.B. /dev/input/event12")
     p.add_argument("--skip-buttons", action="store_true", help="Button-Test überspringen")
@@ -525,6 +568,7 @@ def main():
         connected=[]
 
     evdev_dev = None
+    evdev_error = None
     if not args.skip_buttons:
         evdev_dev, evdev_error = find_evdev_spacemouse(args.evdev)
         if evdev_error:
@@ -537,13 +581,20 @@ def main():
             neutral = neutral_test(dev, args.neutral_seconds, args.countdown_seconds)
             show_neutral_result(neutral, args.neutral_warn)
             input("\nEnter für TEST 2 ...")
-            ranges = range_test(dev, args.range_seconds, args.direction_trigger, args.countdown_seconds)
+            ranges = range_test(
+                dev,
+                args.range_seconds,
+                args.range_min_seconds,
+                args.direction_trigger,
+                args.direction_samples,
+                args.countdown_seconds,
+            )
 
         if args.skip_buttons:
             buttons = {"available": False, "skipped": True, "expected_codes": [], "completed": [], "complete": False}
         else:
             input("\nEnter für TEST 3 ...")
-            buttons = button_test(evdev_dev, args.button_seconds, args.countdown_seconds)
+            buttons = button_test(evdev_dev, args.button_seconds, args.countdown_seconds, evdev_error)
     except KeyboardInterrupt:
         print()
         return fail("Abgebrochen.", 130)
@@ -576,6 +627,8 @@ def main():
         "thresholds": {
             "neutral_warn": args.neutral_warn,
             "direction_trigger": args.direction_trigger,
+            "direction_samples": args.direction_samples,
+            "range_min_seconds": args.range_min_seconds,
         },
         "neutral": neutral,
         "range": ranges,
