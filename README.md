@@ -60,6 +60,15 @@ Ohne Button-Test:
 python spacemouse_test.py --skip-buttons
 ```
 
+Wenn du in `startx`/X11 bist, greift der Button-Test das `evdev`-Gerät standardmäßig exklusiv.
+Dadurch sollten SpaceMouse-Tasten nicht mehr im Terminal oder Desktop Aktionen auslösen.
+
+Nur falls das Probleme macht:
+
+```bash
+python spacemouse_test.py --no-grab
+```
+
 Ohne ANSI-Farben:
 
 ```bash
@@ -73,6 +82,12 @@ Das Script führt Schritt für Schritt durch den Test.
 - **Rot** = fehlt / noch nicht getestet
 - **Grün** = erkannt / bestanden
 - **Gelb** = Hinweis / prüfen
+
+Beim Tastentest wird zusätzlich geprüft:
+
+- ob vor Testbeginn schon eine Taste aktiv ist
+- ob nach dem Loslassen noch eine Taste gedrückt hängt
+- ob das `evdev`-Gerät exklusiv gegriffen werden konnte
 
 Besonders wichtig beim Z-Test:
 

@@ -168,6 +168,19 @@ def key_name(code):
         name = "/".join(name)
     return name or f"KEY_{code}"
 
+def active_key_codes(dev):
+    try:
+        return set(int(code) for code in dev.active_keys())
+    except Exception:
+        return set()
+
+def print_key_list(title, codes):
+    if not codes:
+        return
+    print(title)
+    for code in sorted(codes):
+        print(f"  - {code} ({key_name(code)})")
+
 def neutral_test(dev, seconds, countdown_seconds):
     clear()
     banner("TEST 1/3 – NEUTRAL / DRIFT")
@@ -308,7 +321,7 @@ def range_test(dev, timeout, min_seconds, trigger, required_samples, countdown_s
         }
     return result
 
-def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
+def button_test(dev, timeout, countdown_seconds, unavailable_reason=None, grab=True):
     clear()
     banner("TEST 3/3 – TASTEN")
     print()
@@ -320,7 +333,10 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
         return {
             "available": False,
             "error": unavailable_reason,
+            "grabbed": False,
             "expected_codes": [],
+            "initially_pressed": [],
+            "still_pressed": [],
             "completed": [],
             "complete": False,
         }
@@ -331,17 +347,40 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
         return {
             "available": True,
             "error": "evdev-Gerät meldet keine Tasten-Codes",
+            "grabbed": False,
             "expected_codes": [],
+            "initially_pressed": [],
+            "still_pressed": [],
             "completed": [],
             "complete": False,
         }
 
     print(f"Linux meldet {len(expected)} Tasten-Codes für dieses Gerät.")
+    grabbed = False
+    if grab:
+        try:
+            dev.grab()
+            grabbed = True
+            print(green("Exklusiver evdev-Zugriff aktiv: Tastendrücke werden nicht an X/Terminal weitergereicht."))
+        except OSError as exc:
+            print(yellow(f"Exklusiver evdev-Zugriff nicht möglich: {exc}"))
+            print(yellow("Die Tasten können dadurch weiterhin Aktionen in X/Terminal auslösen."))
+    else:
+        print(yellow("Exklusiver evdev-Zugriff deaktiviert. Tasten können Aktionen in X/Terminal auslösen."))
+
+    initially_pressed = active_key_codes(dev)
+    if initially_pressed:
+        print()
+        print(red("Achtung: Diese Tasten sind bereits vor dem Test gedrückt/aktiv:"))
+        print_key_list("", initially_pressed)
+        print(yellow("Wenn du sie nicht gedrückt hältst, klemmt die Taste eventuell oder das falsche evdev-Gerät ist gewählt."))
+
     print("Drücke jede Taste einmal vollständig und lasse sie wieder los.")
     print()
     countdown(countdown_seconds)
 
-    pressed, released = set(), set()
+    pressed, released = set(initially_pressed), set()
+    held = set(initially_pressed)
     start = time.monotonic()
 
     while True:
@@ -353,8 +392,10 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
                         continue
                     if event.value == 1:
                         pressed.add(int(event.code))
+                        held.add(int(event.code))
                     elif event.value == 0:
                         released.add(int(event.code))
+                        held.discard(int(event.code))
         except OSError as exc:
             print()
             print(red(f"evdev-Lesefehler: {exc}"))
@@ -369,15 +410,17 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
         print(
             f"Vollständig erkannt: {green(str(len(completed)))}/{len(expected)}"
             f" | fehlen: {red(str(len(remaining_codes)))}"
+            f" | gedrückt: {yellow(str(len(held))) if held else green('0')}"
             f" | Restzeit: {max(0,int(timeout-elapsed)):2d}s",
             end="\r" if sys.stdout.isatty() else "\n",
             flush=True,
         )
 
-        if not remaining_codes or elapsed >= timeout:
+        if (not remaining_codes and not held) or elapsed >= timeout:
             break
 
     print("\n")
+    still_pressed = active_key_codes(dev) or held
     if remaining_codes:
         print(red("Nicht vollständig erkannt:"))
         for code in remaining_codes:
@@ -385,13 +428,29 @@ def button_test(dev, timeout, countdown_seconds, unavailable_reason=None):
     else:
         print(green("Alle Tasten wurden gedrückt UND wieder losgelassen."))
 
+    if still_pressed:
+        print()
+        print(red("Diese Tasten sind am Ende noch gedrückt/aktiv:"))
+        print_key_list("", still_pressed)
+    else:
+        print(green("Keine Taste hängt am Ende gedrückt."))
+
+    if grabbed:
+        try:
+            dev.ungrab()
+        except OSError:
+            pass
+
     return {
         "available": True,
+        "grabbed": grabbed,
         "expected_codes": expected,
+        "initially_pressed": sorted(initially_pressed),
+        "still_pressed": sorted(still_pressed),
         "pressed": sorted(pressed),
         "released": sorted(released),
         "completed": sorted(completed),
-        "complete": not remaining_codes,
+        "complete": not remaining_codes and not still_pressed,
     }
 
 def axis_status(d, trigger):
@@ -439,6 +498,9 @@ def build_report(device_name, neutral, ranges, buttons, neutral_warn, trigger, s
         done=len(buttons.get("completed", []))
         L.append(f"Vom Linux-Gerät gemeldete Tasten: {exp}")
         L.append(f"Press + Release erfolgreich:       {done}/{exp}")
+        L.append("Exklusiver evdev-Zugriff:          " + ("JA" if buttons.get("grabbed") else "NEIN"))
+        L.append(f"Vor Test bereits gedrückt:         {len(buttons.get('initially_pressed', []))}")
+        L.append(f"Nach Test noch gedrückt:           {len(buttons.get('still_pressed', []))}")
         L.append("Status: " + ("OK" if button_ok else "CHECK"))
     else:
         L.append("Button-Test nicht verfügbar.")
@@ -501,6 +563,7 @@ def build_parser():
     p.add_argument("--output-dir", default="./reports")
     p.add_argument("--evdev", help="evdev-Pfad für den Button-Test, z.B. /dev/input/event12")
     p.add_argument("--skip-buttons", action="store_true", help="Button-Test überspringen")
+    p.add_argument("--no-grab", action="store_true", help="evdev-Gerät nicht exklusiv greifen")
     p.add_argument("--list-devices", action="store_true", help="erkannte pyspacemouse-/evdev-Geräte ausgeben und beenden")
     p.add_argument("--no-color", action="store_true")
     return p
@@ -594,7 +657,13 @@ def main():
             buttons = {"available": False, "skipped": True, "expected_codes": [], "completed": [], "complete": False}
         else:
             input("\nEnter für TEST 3 ...")
-            buttons = button_test(evdev_dev, args.button_seconds, args.countdown_seconds, evdev_error)
+            buttons = button_test(
+                evdev_dev,
+                args.button_seconds,
+                args.countdown_seconds,
+                evdev_error,
+                grab=not args.no_grab,
+            )
     except KeyboardInterrupt:
         print()
         return fail("Abgebrochen.", 130)
