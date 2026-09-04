@@ -14,7 +14,7 @@ Interaktiver Linux-Hardwaretest für 3Dconnexion SpaceMouse-Geräte.
   - Yaw links / rechts
 - alle Tasten über Linux `evdev`
 - Press **und** Release jeder Taste
-- TXT-Report für Verkauf / Willhaben
+- TXT-Report
 - JSON-Report für technische Dokumentation
 
 ## Installation
